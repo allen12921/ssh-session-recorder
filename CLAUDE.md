@@ -31,9 +31,11 @@ sshd → (per-key environment="REMOTEUSER=<name>" from authorized_keys, needs Pe
          → real pty (interactive, or `ssh -tt host "cmd"`): exec script -f -a -q -e --timing=... <log>
          → no pty (`ssh host "cmd"`, the automation case): bypass script (it would force a pty and
            merge stdout/stderr) — use tee into .log/.log.stderr instead, exit code via PIPESTATUS
-         → exception: if the -c command is actually sshd's external sftp subsystem invocation
-           (`<shell> -c "/path/to/sftp-server"`), exec it directly with zero wrapping — SFTP needs
-           a raw bidirectional channel and would break inside tee/script
+         → exception: if the -c command is sshd's external sftp subsystem invocation
+           (`<shell> -c "/path/to/sftp-server"`) or rsync's remote invocation (`rsync --server ...`,
+           format verified empirically), exec it directly with zero wrapping — both need a raw
+           stdin/stdout channel, and this wrapper never records stdin anyway (only stdout/stderr),
+           so recording them would be pointless even if it didn't risk breaking the protocol
 ```
 
 The three files created per session (`.log`, `.log.timing`, `.log.stderr`) are **all pre-created up front** by `create_session_log.sh`, regardless of which code path ends up using them — the login shell process has no write access to the log directory itself (only execute), so it cannot create new files mid-session.

@@ -13,7 +13,16 @@
 # front and exec it directly, with no logging wrapper at all, before doing
 # anything else (sudo call, REMOTEUSER lookup, banner) — SFTP/SCP just works
 # as if this account had no recording shell.
-if [ "${1:-}" = "-c" ] && [[ "$2" == *sftp-server* ]]; then
+#
+# rsync passthrough: same treatment, by choice rather than necessity — rsync
+# over ssh invokes the remote side as literally "rsync --server ..."
+# (verified empirically), and it technically still worked when piped through
+# tee below. But the transferred file content flows over stdin, which this
+# wrapper never captures anyway (only stdout/stderr are logged), so routing
+# it through the recording path bought nothing but risk of protocol
+# breakage. Treat it exactly like sftp-server: not audited, just passed
+# through.
+if [ "${1:-}" = "-c" ] && [[ "$2" == *sftp-server* || "$2" == rsync\ --server* ]]; then
     exec /bin/bash -c "$2"
 fi
 

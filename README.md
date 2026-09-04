@@ -25,8 +25,9 @@ sshd 接受连接（走 authorized_keys 里某个人的 key）
             不用 script（它会强制分配伪终端，把 stdout/stderr 合并、破坏二进制/换行），
             改用 tee 分别记录两路输出到 .log / .log.stderr，同时通过 PIPESTATUS 保留真实退出码
       → 例外：如果这个 -c 命令其实是 sshd 转发过来的 sftp 子系统请求（scp/sftp
-            客户端），直接原样 exec，完全不经过上面任何录制逻辑——sftp 协议需要
-            裸的双向二进制通道，套进 tee/script 会直接破坏协议
+            客户端）或者 rsync 的远程调用（"rsync --server ..."），直接原样 exec，
+            完全不经过上面任何录制逻辑——这两种场景传的都是文件内容，本来就走 stdin
+            （这条路径根本不记录 stdin），录了也没用，干脆直接豁免
 ```
 
 ### 权限设计要点
@@ -152,12 +153,11 @@ sudo cat /opt/audit/log/<同上>.log.stderr   # 命令的 stderr
 - 多次登录：文件名带时间戳 + PID，不会互相覆盖
 - 客户端伪造 `REMOTEUSER`：被服务端 `AcceptEnv` 白名单机制挡住，完全不生效
 - SFTP/SCP：上传下载双向都验证过，跟没套这层 shell 时行为完全一致（不记录传输内容，纯直通）
+- rsync：20MB 二进制文件上传验证过 md5 前后一致，且确认豁免生效（`/opt/audit/log` 里不会为 rsync 传输生成任何记录）
 
 ## 已知取舍 / 限制
 
-- **SFTP/SCP 走的是完全直通、不记录**：`sshd` 对外部 sftp 子系统（`Subsystem sftp /path/to/sftp-server`）的调用方式跟 `ssh host "cmd"` 是同一种（`<shell> -c "<sftp-server路径>"`），`session-shell` 识别到这种调用会直接原样 `exec`，完全跳过录制逻辑——所以 SFTP/SCP 能正常用，但传输的文件内容本身不会进审计日志。**踩过坑**：第一版实现没处理这个识别逻辑，直接把 sftp 请求也塞进了录制管道，导致协议被破坏、`scp` 直接断连；更严重的是曾经误把还在正常用来做运维操作的账号（`ec2-user`）也切换成了这个 shell，当场把自己的 `scp` 堵死。如果需要审计"谁传了什么文件"，应该用 `sftp-server` 自带的日志能力（`Subsystem sftp /path/to/sftp-server -l VERBOSE` 之类，具体参数以 `man sftp-server` 为准），走 syslog，不是这个仓库现在做的事。
-- **非交互命令模式（`.log`/`.log.stderr` 分流那条路径）只记录 stdout/stderr，不记录 stdin**：`rsync`/`scp -O`（老式 scp 协议）这类"客户端把数据往 stdin 推"的远程命令能正常跑（实测 20MB 二进制文件上传，md5 前后一致），但实际传输的文件内容是通过 stdin 流向远端进程的，我们只 `tee` 了 stdout/stderr——20MB 传完日志文件只有 17KB 左右，基本只是协议握手/校验和之类的小数据，**文件本身的内容不会进审计日志**。这跟 SFTP（整体识别后直接豁免、明确不记录）不是一回事，是个容易被忽略的记录盲区：凡是这种"数据主要走 stdin 上行"的远程命令，都存在同样的问题。
-- rsync 走的还是一般的 `-c` 命令路径（没有像 `sftp-server` 那样被识别豁免），所以它照样会被 `tee` 包一层——目前观察下来协议本身没被破坏（大文件传输、校验和都正常），但没有像 SFTP 那样做过详尽的边界测试，如果以后这条路径出现类似 SFTP 当初那种协议被破坏的情况，参考 `session-shell` 里 sftp-server 那段的处理方式（识别到就直接原样 `exec`，跳过 tee）。
+- **SFTP/SCP 和 rsync 都是完全直通、不审计**：`sshd` 对外部 sftp 子系统（`Subsystem sftp /path/to/sftp-server`）和 `rsync` 走 ssh 时的远程调用方式（实测确认固定是 `rsync --server ...` 开头）都跟 `ssh host "cmd"` 是同一种（`<shell> -c "<命令>"`），`session-shell` 识别到这两种调用会直接原样 `exec`，完全跳过录制逻辑——所以 SFTP/SCP/rsync 都能正常用，但传输的文件内容本身不会进审计日志。这是刻意选择，不是遗漏：这条 `-c` 命令路径本来就只记录 stdout/stderr、不记录 stdin，而文件传输的实际内容大多是走 stdin 上行的，就算不豁免、硬塞进 `tee` 管道，也录不到真正有用的内容（实测过 rsync 走 tee 管道协议本身不会坏，但 20MB 传输完日志只有十几 KB，全是协议握手/校验和之类的噪音）——干脆和 SFTP 一视同仁，直接豁免更干净。**踩过坑**：第一版实现没处理 SFTP 的识别逻辑，直接把 sftp 请求也塞进了录制管道，导致协议被破坏、`scp` 直接断连；更严重的是曾经误把还在正常用来做运维操作的账号（`ec2-user`）也切换成了这个 shell，当场把自己的 `scp` 堵死。如果需要审计"谁传了什么文件"，应该用 `sftp-server`/`rsync` 自带的日志能力（前者 `Subsystem sftp /path/to/sftp-server -l VERBOSE`，具体参数以 `man sftp-server`/`man rsyncd.conf` 为准），走 syslog，不是这个仓库现在做的事。
 - 日志是原始终端字节流（含 ANSI 转义码），没有 tlog 那种结构化 JSON + `journalctl` 字段查询能力，查看/检索没那么方便，用 `cat`/`scriptreplay` 即可。
 - 如果程序主动关掉终端回显（比如 `read -s` 读密码），敲的内容压根不会进日志——这是 `script` 这类工具的固有盲区，不是配置能解决的，不是完整的按键级审计。
 - **`sudoers` 规则的参数没有做值校验**：`ubuntu ALL=(root) NOPASSWD: .../create_session_log.sh` 没锁定具体参数，理论上一个已经登录进来的人可以自己手动再跑一次 `sudo -u root create_session_log.sh <随便什么标签>`，凭空建一个挂着别人名字的空文件，如果再自己手动往里面写内容，能伪造出一份看起来是别人做的"记录"。这个风险目前**没有从技术上完全堵死**（sudoers 语法本身不支持"参数必须等于调用者自己当前的环境变量值"这种校验），只能算接受的残余风险，缓解因素是：伪造这个文件的整个操作过程，本身也会被记录在**这个人自己真实的、无法伪造的会话日志里**——事后审查两份日志能发现破绽。真要完全堵死，需要换一种从内核审计（如 `auditd`/utmp）而不是 shell 环境变量/参数去derive身份的方案，复杂度高很多，本仓库暂未实现。
