@@ -1,0 +1,57 @@
+#!/bin/bash
+# Login-shell wrapper: gets a fresh per-session append-only log file via a
+# narrowly-scoped sudo rule (root can chown the file to the real user), then
+# hands off the pty to `script`, which flushes every write immediately.
+
+# SFTP/SCP passthrough: for an *external* subsystem (`Subsystem sftp
+# /path/to/sftp-server` in sshd_config, as opposed to the built-in
+# `internal-sftp`), sshd execs the login shell as `<shell> -c "<subsystem
+# command>"` (see OpenSSH session.c: do_child's SUBSYSTEM_EXT case) — same
+# invocation shape as a normal `ssh host "cmd"`. Left unhandled, that command
+# would get piped through `tee` below and corrupt the raw SFTP binary
+# protocol (which needs its own stdin/stdout untouched). Recognize it up
+# front and exec it directly, with no logging wrapper at all, before doing
+# anything else (sudo call, REMOTEUSER lookup, banner) — SFTP/SCP just works
+# as if this account had no recording shell.
+if [ "${1:-}" = "-c" ] && [[ "$2" == *sftp-server* ]]; then
+    exec /bin/bash -c "$2"
+fi
+
+# REMOTEUSER is set by sshd from the per-key `environment=` entry in
+# authorized_keys (requires PermitUserEnvironment) — identifies which
+# person's key was used to log in, even though everyone shares the
+# `ubuntu` account. Falls back to "unknown" if not set for a given key.
+mapfile -t _paths < <(sudo -n -u root /opt/audit/bin/create_session_log.sh "${REMOTEUSER:-unknown}")
+LOGFILE="${_paths[0]:-}"
+TIMINGFILE="${_paths[1]:-}"
+STDERRFILE="${_paths[2]:-}"
+if [ -z "$LOGFILE" ] || [ -z "$TIMINGFILE" ] || [ -z "$STDERRFILE" ]; then
+    echo "Failed to allocate session log file; refusing to start an unrecorded session" >&2
+    exit 1
+fi
+
+export SHELL=/bin/bash
+printf '\nATTENTION! Your session is being recorded!\n\n' >&2
+
+if [ "${1:-}" = "-c" ]; then
+    if [ -t 1 ]; then
+        # A real pty WAS allocated for this command (e.g. `ssh -tt host "cmd"`).
+        # script's pty-merging behavior matches what the caller already asked
+        # for, so recording it as-is is fine. -e propagates the real exit code.
+        exec /usr/bin/script -f -a -q -e --timing="$TIMINGFILE" -c "$2" "$LOGFILE"
+    fi
+    # No pty (the common `ssh host "cmd"` automation case). `script` would force
+    # one anyway, merging stdout/stderr and mangling binary/newline data — bad
+    # for scripting callers. Log the two streams separately via `tee` instead,
+    # with the real exit code preserved through PIPESTATUS. No timing file is
+    # produced for this path (nothing to replay — it was never a terminal).
+    exec {stderr_fd}> >(tee -a "$STDERRFILE" >&2)
+    stderr_pid=$!
+    bash -c "$2" 2>&"$stderr_fd" | tee -a "$LOGFILE"
+    rc="${PIPESTATUS[0]}"
+    exec {stderr_fd}>&-
+    wait "$stderr_pid" 2>/dev/null
+    exit "$rc"
+else
+    exec /usr/bin/script -f -a -q -e --timing="$TIMINGFILE" "$LOGFILE"
+fi
