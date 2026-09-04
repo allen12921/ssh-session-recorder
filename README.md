@@ -159,7 +159,18 @@ sudo cat /opt/audit/log/<同上>.log.stderr   # 命令的 stderr
 ## 已知取舍 / 限制
 
 - **SFTP/SCP 和 rsync 都是完全直通、不审计**：`sshd` 对外部 sftp 子系统（`Subsystem sftp /path/to/sftp-server`）和 `rsync` 走 ssh 时的远程调用方式（实测确认固定是 `rsync --server ...` 开头）都跟 `ssh host "cmd"` 是同一种（`<shell> -c "<命令>"`），`session-shell` 识别到这两种调用会直接原样 `exec`，完全跳过录制逻辑——所以 SFTP/SCP/rsync 都能正常用，但传输的文件内容本身不会进审计日志。这是刻意选择，不是遗漏：这条 `-c` 命令路径本来就只记录 stdout/stderr、不记录 stdin，而文件传输的实际内容大多是走 stdin 上行的，就算不豁免、硬塞进 `tee` 管道，也录不到真正有用的内容（实测过 rsync 走 tee 管道协议本身不会坏，但 20MB 传输完日志只有十几 KB，全是协议握手/校验和之类的噪音）——干脆和 SFTP 一视同仁，直接豁免更干净。**踩过坑**：第一版实现没处理 SFTP 的识别逻辑，直接把 sftp 请求也塞进了录制管道，导致协议被破坏、`scp` 直接断连；更严重的是曾经误把还在正常用来做运维操作的账号（`ec2-user`）也切换成了这个 shell，当场把自己的 `scp` 堵死。如果需要审计"谁传了什么文件"，应该用 `sftp-server`/`rsync` 自带的日志能力（前者 `Subsystem sftp /path/to/sftp-server -l VERBOSE`，具体参数以 `man sftp-server`/`man rsyncd.conf` 为准），走 syslog，不是这个仓库现在做的事。
-- **把这个账号当跳板（`ssh -J`/`ProxyJump`）转发到其他机器，完全不会被录制，且这次连"识别再豁免"都算不上**：跳板转发在 SSH 协议层走的是 `direct-tcpip` 通道，不是"session"通道——sshd 收到这种请求会直接在内部处理转发，根本不会 exec 登录用户的 shell，`session-shell` 完全不会被调用，连有没有这层包装都无关紧要。实测隔离验证过：清空日志目录后单独跑一次跳板 `scp`+`ssh`，`/opt/audit/log` 里记录数是 0；只有事后另外单独执行的检查命令自己产生了一条记录。这个不是本仓库能通过改 `session-shell` 逻辑堵住的（因为压根走不到那一层），要审计跳板转发需要在 sshd 层面想办法（比如 `PermitOpen` 限制目标、或者干脆用专门的堡垒机方案），不是这个仓库解决的问题。
+- **把这个账号当跳板（`ssh -J`/`ProxyJump`）转发到其他机器，完全不会被录制，且这次连"识别再豁免"都算不上**：跳板转发在 SSH 协议层走的是 `direct-tcpip` 通道，不是"session"通道——sshd 收到这种请求会直接在内部处理转发，根本不会 exec 登录用户的 shell，`session-shell` 完全不会被调用，连有没有这层包装都无关紧要。实测隔离验证过：清空日志目录后单独跑一次跳板 `scp`+`ssh`，`/opt/audit/log` 里记录数是 0；只有事后另外单独执行的检查命令自己产生了一条记录。这个不是本仓库能通过改 `session-shell` 逻辑堵住的（因为压根走不到那一层），要审计跳板转发需要在 sshd 层面想办法，不是这个仓库解决的问题。
+
+**如果要彻底堵住这个账号被当跳板用**（而不只是审计不到）：查过 OpenSSH 源码（`serverloop.c`），`-W`/`ProxyJump` 用的 `direct-tcpip` 通道请求，判断放不放行走的是 `AllowTcpForwarding` 的 **local** 那部分权限位（`options.allow_tcp_forwarding & FORWARD_LOCAL`），所以把这个账号的 `AllowTcpForwarding` 设成 `no`（或 `remote`，只保留远程转发那部分）确实能挡住。注意这是个比较钝的开关：
+
+- 会把这个账号**所有** TCP 转发能力一起挡掉，不只是跳板——`-L`/`-R`/`-D` 全部一起没了，如果这个账号平时还有正当的端口转发用途会一起被挡。
+- `AllowTcpForwarding` 默认是全局生效的 sshd 配置项，要精确只对目标账号生效，得用 `Match User <账号>` 包一层，不要直接改全局默认值（本仓库前面已经因为改全局 sshd 配置锁死过账号一次，教训见上文）：
+  ```
+  Match User ubuntu
+      AllowTcpForwarding no
+  ```
+  改完照例先 `sshd -t` 校验语法，留一个已验证能登录的窗口再 reload，别把自己也锁在外面。
+- 本仓库目前**没有**自动化这个配置（这是可选的进一步加固，不是默认部署的一部分），需要的话手动加。
 - 日志是原始终端字节流（含 ANSI 转义码），没有 tlog 那种结构化 JSON + `journalctl` 字段查询能力，查看/检索没那么方便，用 `cat`/`scriptreplay` 即可。
 - 如果程序主动关掉终端回显（比如 `read -s` 读密码），敲的内容压根不会进日志——这是 `script` 这类工具的固有盲区，不是配置能解决的，不是完整的按键级审计。
 - **`sudoers` 规则的参数没有做值校验**：`ubuntu ALL=(root) NOPASSWD: .../create_session_log.sh` 没锁定具体参数，理论上一个已经登录进来的人可以自己手动再跑一次 `sudo -u root create_session_log.sh <随便什么标签>`，凭空建一个挂着别人名字的空文件，如果再自己手动往里面写内容，能伪造出一份看起来是别人做的"记录"。这个风险目前**没有从技术上完全堵死**（sudoers 语法本身不支持"参数必须等于调用者自己当前的环境变量值"这种校验），只能算接受的残余风险，缓解因素是：伪造这个文件的整个操作过程，本身也会被记录在**这个人自己真实的、无法伪造的会话日志里**——事后审查两份日志能发现破绽。真要完全堵死，需要换一种从内核审计（如 `auditd`/utmp）而不是 shell 环境变量/参数去derive身份的方案，复杂度高很多，本仓库暂未实现。
