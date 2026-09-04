@@ -59,6 +59,19 @@ sudo chattr +i /home/ubuntu/.ssh/authorized_keys   # 见下面的说明，+a 不
 
 ## 部署步骤
 
+用 `install.sh` 一步到位（幂等，可以放心重复执行）：
+
+```bash
+sudo ./install.sh ubuntu
+```
+
+它会依次做：建 `/opt/audit/bin`/`/opt/audit/log` 目录、装两个脚本、生成并校验 `sudoers.d/audit-session-log-<账号>`（sudoers 规则**固定绑定这一个账号**，不用用户组——多个共享账号就对每个账号各跑一次 `install.sh`，会各自生成一份独立的 sudoers 文件，互不影响）、注册 `/etc/shells`、原地加固该账号的 `authorized_keys`/`~/.ssh/environment`（`chown root + chattr +i`）、最后把登录 shell 切过去。**只会改动传给它的这一个账号**，跑完立刻用另一个终端窗口验证一下其他账号还能不能正常登录，别把自己锁在外面。
+
+`PermitUserEnvironment yes`（用于 REMOTEUSER 标注，见下一节）不在脚本自动化范围内，因为这是全局 sshd 配置，改错了影响所有账号——手动改、手动 `sshd -t` 校验、手动 reload，务必谨慎。
+
+<details>
+<summary>不想用脚本、想自己一步步来，可以照着展开的手动步骤做</summary>
+
 1. 建目录：
    ```bash
    sudo mkdir -p /opt/audit/bin /opt/audit/log
@@ -70,21 +83,25 @@ sudo chattr +i /home/ubuntu/.ssh/authorized_keys   # 见下面的说明，+a 不
    sudo install -m 0755 -o root -g root bin/create_session_log.sh /opt/audit/bin/create_session_log.sh
    sudo install -m 0755 -o root -g root bin/session-shell        /opt/audit/bin/session-shell
    ```
-3. 装 sudoers 规则：
+3. 装 sudoers 规则（把 `ubuntu` 换成目标账号）：
    ```bash
-   sudo install -m 0440 -o root -g root sudoers.d/audit-session-log /etc/sudoers.d/audit-session-log
-   sudo visudo -cf /etc/sudoers.d/audit-session-log   # 校验语法
+   sed "s/^ubuntu /目标账号 /" sudoers.d/audit-session-log | sudo tee /etc/sudoers.d/audit-session-log-目标账号 > /dev/null
+   sudo chmod 0440 /etc/sudoers.d/audit-session-log-目标账号
+   sudo visudo -cf /etc/sudoers.d/audit-session-log-目标账号   # 校验语法
    ```
 4. 注册为合法登录 shell（非强制，纯防御性；如果这台机器 PAM 没配 `pam_shells`，不加也能正常登录，先用 `grep -rn pam_shells /etc/pam.d/` 确认）：
    ```bash
    echo "/opt/audit/bin/session-shell" | sudo tee -a /etc/shells
    ```
-5. 把目标共享账号的登录 shell 改成这个包装脚本（**只改这一个账号**，改完立刻用另一个终端窗口验证一遍其他账号是否还能正常登录，别把自己锁在外面）：
+5. 加固目标账号的 `authorized_keys` 和 `~/.ssh/environment`（见上面"走过的弯路"一节，直接原地 `chown`+`chattr +i`，不要碰 `AuthorizedKeysFile`）。
+6. 把目标共享账号的登录 shell 改成这个包装脚本（**只改这一个账号**，改完立刻用另一个终端窗口验证一遍其他账号是否还能正常登录，别把自己锁在外面）：
    ```bash
    sudo usermod -s /opt/audit/bin/session-shell ubuntu
    ```
-6. 加固 `authorized_keys` 和 `~/.ssh/environment`（见上面"走过的弯路"一节，直接原地 `chown`+`chattr +i`，不要碰 `AuthorizedKeysFile`）。
-7. （可选，强烈建议）按 key 标注登录者身份——见下一节。
+
+</details>
+
+（可选，强烈建议）按 key 标注登录者身份——见下一节。
 
 ## 按 SSH key 标注登录者身份（REMOTEUSER）
 
