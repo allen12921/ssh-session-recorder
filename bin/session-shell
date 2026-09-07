@@ -22,9 +22,108 @@
 # it through the recording path bought nothing but risk of protocol
 # breakage. Treat it exactly like sftp-server: not audited, just passed
 # through.
-if [ "${1:-}" = "-c" ] && [[ "$2" == *sftp-server* || "$2" == rsync\ --server* ]]; then
-    exec /bin/bash -c "$2"
-fi
+#
+# The match must be anchored to the start of the command and reject shell
+# metacharacters, not just test for the marker substring anywhere in the
+# string: sshd hands a plain `ssh host "arbitrary text"` exec command to this
+# same "-c" branch with no way to tell it apart from a genuine
+# subsystem/rsync invocation, so the command is fully attacker-controlled. A
+# naive `*sftp-server*`/`rsync --server*` substring or bare-prefix check lets
+# that attacker smuggle any other command past recording entirely, e.g.
+# `nc host 22 # sftp-server` (old check matched, exec'd with zero wrapping)
+# or `rsync --server ...; evil` (old check matched the prefix, then the
+# unrecorded `bash -c` below ran both halves). Rejecting metacharacters closes
+# that off: a real sftp-server/rsync invocation never contains them.
+#
+# Anchoring the *name* still isn't enough by itself: the login account is
+# unprivileged, so it can plant its own file (or a symlink) literally named
+# "sftp-server" under any directory it can write to (its own home, /tmp, ...)
+# and pass its path in the command — that would match a bare
+# `.../sftp-server` pattern with no metacharacters at all and get exec'd with
+# zero recording, same as before, just via a fake binary instead of a comment
+# trick. Checking that the containing directory isn't currently *writable* by
+# this account isn't enough either — the account owns any directory it just
+# created, so it can plant the file, `chmod` the directory back down to
+# read-only, and the check would still pass (chmod'ing your own file/dir back
+# and forth is always allowed regardless of current mode). What actually
+# can't be forged without already being root is *ownership*: only root can
+# `chown` a path to uid 0.
+#
+# Ownership of just the resolved file and its immediate parent still isn't
+# the full story:
+#   - Root can own a path while still leaving it group/other-writable (e.g.
+#     an admin who chmod 777'd it by mistake) — ownership alone doesn't
+#     prove this account can't overwrite its *content*, only that it can't
+#     rename/delete it via the parent directory. Both file and parent must
+#     also fail `-w` for this account.
+#   - Even if the immediate parent is solid, a writable *grandparent* would
+#     let this account delete/recreate the parent itself, forging a
+#     "root-owned, non-writable" parent whenever it wants. The only way to
+#     rule that out is to walk every ancestor up to `/`, not just one level.
+# is_root_locked() does both: uid 0 *and* not-writable-by-us, at every
+# component from the given path up to the filesystem root. (On a real
+# system, /, /usr, /usr/lib, etc. are all root:root 0755 — this only fails
+# on genuine misconfiguration, or on a path this account could have
+# influenced.)
+is_root_locked() {
+    local p="$1" uid
+    while :; do
+        uid="$(stat -c '%u' -- "$p" 2>/dev/null)" || return 1
+        [ "$uid" = "0" ] || return 1
+        [ -w "$p" ] && return 1
+        [ "$p" = "/" ] && return 0
+        p="$(dirname -- "$p")"
+    done
+}
+#
+# Checking `$resolved` and then executing the original `$2` (or a bare
+# command name looked up via `$PATH`) would reopen a time-of-check/
+# time-of-use race, or trust whatever `$PATH` happens to resolve to: if
+# `$candidate` is a symlink under a directory the login user owns, they can
+# point it at the real root-owned binary just long enough for the checks
+# above to pass, then flip it back before the exec below runs — `bash -c
+# "$2"` (or a PATH lookup) re-resolves from scratch at that point, so it
+# would never actually reference the file that was validated. Executing the
+# already-resolved canonical path instead closes that gap: everything after
+# this point references the exact root-owned file the checks just verified,
+# not whatever `$candidate`/`$PATH` currently points to. This is also why
+# the rsync branch below doesn't just trust a bare `rsync` command name —
+# `bash -c "rsync --server ..."` looks that up via this process's `$PATH`,
+# which this login shell has no control over (nothing here sets it before
+# this point), so it can't be trusted any more than the sftp path string
+# can; it's resolved against a fixed list of standard system directories
+# instead, ignoring whatever `$PATH` was inherited.
+case "$2" in
+    *[$'\n;&|`$<>']*) ;;
+    *)
+        if [ "${1:-}" = "-c" ]; then
+            if [[ "$2" =~ ^(/[^[:space:]]*/sftp-server)([[:space:]].*)?$ ]]; then
+                candidate="${BASH_REMATCH[1]}"
+                extra_args="${BASH_REMATCH[2]}"
+                resolved="$(realpath -e -- "$candidate" 2>/dev/null || true)"
+                if [ -n "$resolved" ] && [ "$(basename -- "$resolved")" = "sftp-server" ] \
+                        && is_root_locked "$resolved"; then
+                    exec /bin/bash -c "$resolved$extra_args"
+                fi
+            elif [[ "$2" == rsync\ --server\ * ]]; then
+                rsync_bin=""
+                for d in /usr/bin /usr/local/bin /bin /usr/sbin /usr/local/sbin /sbin; do
+                    if [ -x "$d/rsync" ]; then
+                        rsync_bin="$d/rsync"
+                        break
+                    fi
+                done
+                if [ -n "$rsync_bin" ]; then
+                    resolved="$(realpath -e -- "$rsync_bin" 2>/dev/null || true)"
+                    if [ -n "$resolved" ] && [ "$(basename -- "$resolved")" = "rsync" ] \
+                            && is_root_locked "$resolved"; then
+                        exec /bin/bash -c "$resolved${2#rsync}"
+                    fi
+                fi
+            fi
+        fi
+        ;;
+esac
 
 # REMOTEUSER is set by sshd from the per-key `environment=` entry in
 # authorized_keys (requires PermitUserEnvironment) — identifies which
@@ -43,6 +142,19 @@ export SHELL=/bin/bash
 printf '\nATTENTION! Your session is being recorded!\n\n' >&2
 
 if [ "${1:-}" = "-c" ]; then
+    # Record the command line itself, not just its output: `script`/`tee`
+    # below only ever capture what the command *prints*, and for anything
+    # whose stdout isn't human-readable text (a binary protocol relayed
+    # through `nc`/`socat` for a ProxyCommand-driven bastion hop, for
+    # instance) that leaves no way to tell from the log alone what was even
+    # invoked. This one line — appended before the command runs, into the
+    # same chattr +a file, so it's exactly as tamper-resistant as everything
+    # else in it — is what actually makes those cases auditable: even though
+    # the inner traffic itself stays opaque (it's a separate, end-to-end
+    # encrypted SSH session; nothing running on this account could ever
+    # decrypt it, chattr +a or not), the log still proves *that* and *when*
+    # this account ran that exact command line.
+    printf '+++ %s exec -c %q\n' "$(date -Is)" "$2" >> "$LOGFILE" 2>/dev/null
     if [ -t 1 ]; then
         # A real pty WAS allocated for this command (e.g. `ssh -tt host "cmd"`).
         # script's pty-merging behavior matches what the caller already asked
