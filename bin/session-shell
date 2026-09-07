@@ -76,6 +76,25 @@ is_root_locked() {
     done
 }
 #
+# Shared by the rsync and scp branches below: given a bare command name,
+# find it in a fixed list of standard system directories (never `$PATH` —
+# see the comment further down on why) and print its resolved path only if
+# it survives realpath + basename + is_root_locked. Empty output means "not
+# trusted", checked by the caller with `[ -n "$resolved" ]`.
+resolve_trusted_bin() {
+    local name="$1" d candidate resolved
+    for d in /usr/bin /usr/local/bin /bin /usr/sbin /usr/local/sbin /sbin; do
+        candidate="$d/$name"
+        [ -x "$candidate" ] || continue
+        resolved="$(realpath -e -- "$candidate" 2>/dev/null || true)"
+        if [ -n "$resolved" ] && [ "$(basename -- "$resolved")" = "$name" ] && is_root_locked "$resolved"; then
+            printf '%s' "$resolved"
+            return 0
+        fi
+    done
+    return 1
+}
+#
 # Checking `$resolved` and then executing the original `$2` (or a bare
 # command name looked up via `$PATH`) would reopen a time-of-check/
 # time-of-use race, or trust whatever `$PATH` happens to resolve to: if
@@ -106,19 +125,40 @@ case "$2" in
                     exec /bin/bash -c "$resolved$extra_args"
                 fi
             elif [[ "$2" == rsync\ --server\ * ]]; then
-                rsync_bin=""
-                for d in /usr/bin /usr/local/bin /bin /usr/sbin /usr/local/sbin /sbin; do
-                    if [ -x "$d/rsync" ]; then
-                        rsync_bin="$d/rsync"
-                        break
-                    fi
+                if resolved="$(resolve_trusted_bin rsync)"; then
+                    exec /bin/bash -c "$resolved${2#rsync}"
+                fi
+            elif [[ "$2" == scp\ * ]]; then
+                # Legacy scp (pre-9.0 OpenSSH clients default to this, not the
+                # SFTP protocol) invokes the remote side as `scp -t <dest>`
+                # (uploads), `scp -f <src>` (downloads), or with extra
+                # single-letter flags like `-r`/`-p` mixed in — empirically
+                # confirmed (`scp -t /tmp/x`, `scp -f /tmp/x`, `scp -r -t
+                # /tmp/dir`) against a real client/server pair, not just
+                # inferred. Same reasoning as sftp-server/rsync: recording
+                # this protocol's bytes is pointless noise, not useful audit
+                # content, since the actual file data never reaches this
+                # wrapper's stdin capture either way — worth exempting for
+                # the same reason, not just tolerable if left unexempted.
+                # Validated the same way as rsync: every token except the
+                # trailing path must be a bare single-letter flag or `--`,
+                # and at least one of them must be `-t`/`-f` (the actual
+                # mode selector) — otherwise this isn't really scp's
+                # invocation shape, just something that happens to start
+                # with the word "scp".
+                read -ra _scp_words <<< "$2"
+                _scp_ok=1
+                _scp_has_mode=""
+                for ((_i = 1; _i < ${#_scp_words[@]} - 1; _i++)); do
+                    case "${_scp_words[_i]}" in
+                        -t|-f) _scp_has_mode=1 ;;
+                        -[a-zA-Z]|--) ;;
+                        *) _scp_ok=0 ;;
+                    esac
                 done
-                if [ -n "$rsync_bin" ]; then
-                    resolved="$(realpath -e -- "$rsync_bin" 2>/dev/null || true)"
-                    if [ -n "$resolved" ] && [ "$(basename -- "$resolved")" = "rsync" ] \
-                            && is_root_locked "$resolved"; then
-                        exec /bin/bash -c "$resolved${2#rsync}"
-                    fi
+                if [ "$_scp_ok" = 1 ] && [ -n "$_scp_has_mode" ] && [ "${#_scp_words[@]}" -ge 2 ] \
+                        && resolved="$(resolve_trusted_bin scp)"; then
+                    exec /bin/bash -c "$resolved${2#scp}"
                 fi
             fi
         fi
